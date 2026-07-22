@@ -7,6 +7,7 @@ class MoreMenuScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = [
+      (Icons.phone_in_talk_rounded, CcColors.green, 'Calling Service', 'Auto-call + recording control', const CallingServiceScreen()),
       (Icons.event_repeat_rounded, CcColors.amber, 'Follow-ups', 'Daily follow-up & reminders', const FollowupsMeetingsScreen()),
       (Icons.chat_rounded, CcColors.green, 'WhatsApp', 'Automation triggers', const WhatsAppProposalsDocsScreen(initialTab: 0)),
       (Icons.description_rounded, CcColors.blue500, 'Proposals', 'Quick view & share', const WhatsAppProposalsDocsScreen(initialTab: 1)),
@@ -17,7 +18,7 @@ class MoreMenuScreen extends StatelessWidget {
       (Icons.notifications_rounded, CcColors.orange, 'Notifications', 'Alerts & reminders', const NotificationsOfflineSettingsScreen(initialTab: 0)),
       (Icons.cloud_sync_rounded, CcColors.cyan400, 'Offline Sync', 'Cache & retry queue', const NotificationsOfflineSettingsScreen(initialTab: 1)),
       (Icons.settings_rounded, CcColors.textMuted, 'Profile Settings', 'Permissions & device', const NotificationsOfflineSettingsScreen(initialTab: 2)),
-      (Icons.lock_rounded, CcColors.blue500, 'Login Security', 'Device binding & app lock', const LoginSecurityScreen()),
+      
       if (role == 'Manager') (Icons.admin_panel_settings_rounded, CcColors.purple, 'Manager View', 'Team dashboard & review', const ManagerViewScreen()),
     ];
     return BrandedScaffold(

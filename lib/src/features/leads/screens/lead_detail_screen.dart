@@ -15,6 +15,12 @@ class _LeadDetailScreenState extends State<LeadDetailScreen> with SingleTickerPr
   void initState() {
     super.initState();
     tab = TabController(length: 4, vsync: this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final lead = widget.lead;
+      if (lead != null && lead.id > 0) {
+        unawaited(CrmScope.of(context).fetchLeadDetail(lead.id));
+      }
+    });
   }
 
   @override
@@ -25,7 +31,7 @@ class _LeadDetailScreenState extends State<LeadDetailScreen> with SingleTickerPr
 
   @override
   Widget build(BuildContext context) {
-    final lead = widget.lead ?? demoLeads.first;
+    final lead = widget.lead ?? (CrmScope.of(context).leads.isNotEmpty ? CrmScope.of(context).leads.first : demoLeads.first);
     return BrandedScaffold(
       title: 'Lead Details',
       actions: [IconButton(icon: const Icon(Icons.edit_outlined), onPressed: () {}), IconButton(icon: const Icon(Icons.more_vert_rounded), onPressed: () {})],
@@ -46,7 +52,7 @@ class _LeadDetailScreenState extends State<LeadDetailScreen> with SingleTickerPr
               Wrap(spacing: 8, runSpacing: 8, children: [
                 CcChip(label: 'AI Score ${lead.score}', color: CcColors.green, icon: Icons.bolt_rounded, filled: true),
                 CcChip(label: 'Priority ${lead.priority}', color: CcColors.red, icon: Icons.flag_rounded, filled: true),
-                const CcChip(label: 'Status New Lead', color: CcColors.blue500, filled: true),
+                CcChip(label: 'Lead ID ${lead.id > 0 ? lead.id : '-'}', color: CcColors.blue500, filled: true),
               ]),
             ]),
           ),

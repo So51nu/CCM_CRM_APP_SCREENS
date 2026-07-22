@@ -1,8 +1,18 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
+part 'src/core/api/api_config.dart';
+part 'src/core/api/api_client.dart';
+part 'src/core/storage/session_store.dart';
+part 'src/core/services/native_call_bridge.dart';
+part 'src/core/state/crm_app_state.dart';
 part 'src/app/click_connect_ai_crm_preview_app.dart';
 part 'src/core/theme/cc_colors.dart';
 part 'src/core/models/lead.dart';
@@ -29,6 +39,10 @@ part 'src/features/leads/tabs/lead_timeline_tab.dart';
 part 'src/features/leads/widgets/timeline_item.dart';
 part 'src/features/leads/tabs/lead_files_tab.dart';
 part 'src/features/leads/tabs/lead_invoices_tab.dart';
+part 'src/features/calling/screens/calling_service_screen.dart';
+part 'src/features/call_feedback/screens/call_feedback_screen.dart';
+part 'src/features/recording/screens/recording_save_screen.dart';
+part 'src/features/profile/screens/profile_screen.dart';
 part 'src/features/smart_calling/screens/smart_calling_screen.dart';
 part 'src/features/smart_calling/widgets/calling_action_tile.dart';
 part 'src/features/smart_calling/screens/verified_call_tracking_screen.dart';

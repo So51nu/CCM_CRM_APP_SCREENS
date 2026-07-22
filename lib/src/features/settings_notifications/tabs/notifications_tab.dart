@@ -1,61 +1,70 @@
 part of '../../../../click_connect_ai_crm_ui.dart';
 
-class _NotificationsTab extends StatelessWidget {
+class _NotificationsTab extends StatefulWidget {
   const _NotificationsTab();
 
   @override
-  Widget build(BuildContext context) {
-    final items = const [
-      (Icons.person_add_alt_rounded, CcColors.blue500, 'New Lead Assigned', 'Rahul Mehta has been assigned to you.', '10:30 AM'),
-      (Icons.event_repeat_rounded, CcColors.amber, 'Follow-up Due', 'You have 12 follow-ups due today.', '09:15 AM'),
-      (Icons.event_available_rounded, CcColors.purple, 'Meeting Reminder', 'Product Demo with Acme Corp at 11:00 AM.', 'Yesterday'),
-      (Icons.chat_rounded, CcColors.green, 'Manager Message', 'Great progress this week! Keep it up. 👏', 'Yesterday'),
-      (Icons.description_rounded, CcColors.red, 'Proposal Follow-up', 'Follow up with Globex Corp proposal.', 'May 14'),
-      (Icons.currency_rupee_rounded, CcColors.green, 'Payment Reminder', 'Payment of ₹45,000 is due from TechNova.', 'May 14'),
-      (Icons.warning_amber_rounded, CcColors.red, 'Overdue Follow-up', '5 follow-ups are overdue.', 'May 13'),
-      (Icons.track_changes_rounded, CcColors.orange, 'Target Pending Alert', 'You are behind on your monthly target by 15%.', 'May 13'),
-    ];
+  State<_NotificationsTab> createState() => _NotificationsTabState();
+}
 
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: const [
-              CcChip(label: 'All', filled: true),
-              CcChip(label: 'Unread 8'),
-              CcChip(label: 'Important'),
+class _NotificationsTabState extends State<_NotificationsTab> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => CrmScope.of(context).refreshNotifications());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final app = CrmScope.of(context);
+    final fallback = const [
+      {'type': 'lead', 'title': 'New Lead Assigned', 'message': 'Assigned leads API/notifications connected.', 'created_at': 'Now'},
+      {'type': 'followup', 'title': 'Follow-up Due', 'message': 'Followups will appear from CRM API.', 'created_at': 'Today'},
+    ];
+    final items = app.notifications.isNotEmpty ? app.notifications : fallback;
+
+    return AnimatedBuilder(
+      animation: app,
+      builder: (context, _) => RefreshIndicator(
+        onRefresh: app.refreshNotifications,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                const CcChip(label: 'All', filled: true),
+                CcChip(label: 'Unread ${items.length}'),
+                const CcChip(label: 'Important'),
+              ]),
+              const SizedBox(height: 12),
+              ...items.map((raw) {
+                final item = _asMap(raw);
+                final type = _text(item['type'] ?? item['category'], 'info').toLowerCase();
+                final icon = type.contains('lead') ? Icons.person_add_alt_rounded : type.contains('follow') ? Icons.event_repeat_rounded : type.contains('meeting') ? Icons.event_available_rounded : type.contains('payment') ? Icons.currency_rupee_rounded : Icons.notifications_rounded;
+                final color = type.contains('lead') ? CcColors.blue500 : type.contains('follow') ? CcColors.amber : type.contains('meeting') ? CcColors.purple : type.contains('payment') ? CcColors.green : CcColors.orange;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: GlassCard(
+                    child: Row(
+                      children: [
+                        IconBadge(icon: icon, color: color, size: 42),
+                        const SizedBox(width: 12),
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(_text(item['title'] ?? item['subject'], 'Notification'), style: const TextStyle(fontWeight: FontWeight.w900)),
+                          Text(_text(item['message'] ?? item['body'] ?? item['description'], '-'), style: const TextStyle(color: CcColors.textMuted, height: 1.35)),
+                        ])),
+                        Text(_prettyDate(item['created_at'] ?? item['time'] ?? item['date']), style: const TextStyle(color: CcColors.textMuted, fontSize: 12)),
+                        const SizedBox(width: 6),
+                        const CircleAvatar(radius: 4, backgroundColor: CcColors.blue500),
+                      ],
+                    ),
+                  ),
+                );
+              }),
             ],
           ),
-          const SizedBox(height: 12),
-          ...items.map((item) {
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: GlassCard(
-                child: Row(
-                  children: [
-                    IconBadge(icon: item.$1, color: item.$2, size: 42),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(item.$3, style: const TextStyle(fontWeight: FontWeight.w900)),
-                          Text(item.$4, style: const TextStyle(color: CcColors.textMuted, height: 1.35)),
-                        ],
-                      ),
-                    ),
-                    Text(item.$5, style: const TextStyle(color: CcColors.textMuted, fontSize: 12)),
-                    const SizedBox(width: 6),
-                    const CircleAvatar(radius: 4, backgroundColor: CcColors.blue500),
-                  ],
-                ),
-              ),
-            );
-          }),
-        ],
+        ),
       ),
     );
   }

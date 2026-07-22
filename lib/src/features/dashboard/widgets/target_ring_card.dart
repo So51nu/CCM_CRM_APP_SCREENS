@@ -1,10 +1,16 @@
 part of '../../../../click_connect_ai_crm_ui.dart';
 
 class TargetRingCard extends StatelessWidget {
-  const TargetRingCard({super.key});
+  final String target;
+  final String completed;
+  const TargetRingCard({super.key, this.target = '100', this.completed = '0'});
 
   @override
   Widget build(BuildContext context) {
+    final targetNum = math.max(1, _int(target, 100));
+    final completedNum = math.max(0, _int(completed, 0));
+    final progress = (completedNum / targetNum).clamp(0.0, 1.0);
+    final percent = (progress * 100).round();
     return GlassCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -14,12 +20,12 @@ class TargetRingCard extends StatelessWidget {
           Expanded(
             child: Center(
               child: CustomPaint(
-                painter: RingPainter(progress: .45),
-                child: const SizedBox(width: 82, height: 82, child: Center(child: Text('45%', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)))),
+                painter: RingPainter(progress: progress),
+                child: SizedBox(width: 82, height: 82, child: Center(child: Text('$percent%', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)))),
               ),
             ),
           ),
-          const Center(child: Text('45 / 100', style: TextStyle(color: CcColors.textSoft, fontWeight: FontWeight.w800))),
+          Center(child: Text('$completedNum / $targetNum', style: const TextStyle(color: CcColors.textSoft, fontWeight: FontWeight.w800))),
         ],
       ),
     );
@@ -43,5 +49,3 @@ class RingPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant RingPainter oldDelegate) => oldDelegate.progress != progress;
 }
-
-

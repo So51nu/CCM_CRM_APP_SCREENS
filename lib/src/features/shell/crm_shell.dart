@@ -11,43 +11,83 @@ class CrmShell extends StatefulWidget {
 
 class _CrmShellState extends State<CrmShell> {
   int index = 0;
+  int _lastOpenedFeedbackSerial = 0;
+  bool _feedbackRouteOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final app = CrmScope.of(context);
+      unawaited(app.refreshLeads(silent: true));
+      unawaited(app.ensureRealtimeCallSync(reason: 'shell_start'));
+    });
+  }
+
+  void _openFeedbackIfNeeded(CrmAppState app) {
+    if (app.pendingFeedbackSerial <= 0 || app.pendingFeedbackSerial == _lastOpenedFeedbackSerial || _feedbackRouteOpen) return;
+    _lastOpenedFeedbackSerial = app.pendingFeedbackSerial;
+    _feedbackRouteOpen = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Call ended. Feedback form auto-opened.')),
+      );
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const CallFeedbackScreen(openedFromCall: true)),
+      );
+      if (mounted) _feedbackRouteOpen = false;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    final isManager = widget.role == 'Manager';
+    final app = CrmScope.of(context);
     final pages = <Widget>[
-      isManager ? const ManagerViewScreen(inShell: true) : const TelecallerDashboardScreen(),
-      const LeadsScreen(),
-      const SmartCallingScreen(),
-      const AiCoachScreen(),
-      MoreMenuScreen(role: widget.role),
+      const CallingServiceScreen(),
+      const RecordingSaveScreen(),
+      const ProfileScreen(),
     ];
-    return Scaffold(
-      backgroundColor: CcColors.navy950,
-      body: IndexedStack(index: index, children: pages),
-      bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          color: CcColors.navy900,
-          border: Border(top: BorderSide(color: CcColors.line)),
-        ),
-        child: SafeArea(
-          child: NavigationBar(
-            backgroundColor: Colors.transparent,
-            indicatorColor: CcColors.blue500.withValues(alpha: .24),
-            selectedIndex: index,
-            onDestinationSelected: (v) => setState(() => index = v),
-            destinations: const [
-              NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard_rounded), label: 'Dashboard'),
-              NavigationDestination(icon: Icon(Icons.people_alt_outlined), selectedIcon: Icon(Icons.people_alt_rounded), label: 'My Leads'),
-              NavigationDestination(icon: Icon(Icons.phone_in_talk_outlined), selectedIcon: Icon(Icons.phone_in_talk_rounded), label: 'Smart Calling'),
-              NavigationDestination(icon: Icon(Icons.auto_awesome_outlined), selectedIcon: Icon(Icons.auto_awesome_rounded), label: 'AI Coach'),
-              NavigationDestination(icon: Icon(Icons.more_horiz_rounded), selectedIcon: Icon(Icons.more_rounded), label: 'More'),
-            ],
+    return AnimatedBuilder(
+      animation: app,
+      builder: (context, _) {
+        _openFeedbackIfNeeded(app);
+        return Scaffold(
+        backgroundColor: CcColors.navy950,
+        body: IndexedStack(index: index, children: pages),
+        bottomNavigationBar: Container(
+          decoration: const BoxDecoration(
+            color: CcColors.navy900,
+            border: Border(top: BorderSide(color: CcColors.line)),
+          ),
+          child: SafeArea(
+            child: NavigationBar(
+              backgroundColor: Colors.transparent,
+              indicatorColor: CcColors.blue500.withValues(alpha: .24),
+              selectedIndex: index,
+              onDestinationSelected: (v) => setState(() => index = v),
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.phone_in_talk_outlined),
+                  selectedIcon: Icon(Icons.phone_in_talk_rounded),
+                  label: 'Calling',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.mic_external_on_outlined),
+                  selectedIcon: Icon(Icons.mic_external_on_rounded),
+                  label: 'Recording',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.person_outline_rounded),
+                  selectedIcon: Icon(Icons.person_rounded),
+                  label: 'Profile',
+                ),
+              ],
+            ),
           ),
         ),
-      ),
+      );
+      },
     );
   }
 }
-
-

@@ -1,419 +1,564 @@
 package com.example.android_companion_app
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.telephony.PhoneStateListener
 import android.telephony.TelephonyManager
-import org.json.JSONObject
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.io.BufferedReader
+import java.io.File
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLEncoder
+import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONArray
+import org.json.JSONObject
 
 class CallPollingService : Service() {
-    companion object {
-        @Volatile var isRunning: Boolean = false
-        const val CHANNEL_ID = "crm_call_companion_channel"
-        const val NOTIFICATION_ID = 7301
-    }
-
+    private lateinit var prefs: SharedPreferences
     private val handler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
-    private var polling = false
-    private var endingCall = false
-    private var receiverRegistered = false
+    private val polling = AtomicBoolean(false)
+    private val uploadRetrying = AtomicBoolean(false)
+    private var phoneStateListener: PhoneStateListener? = null
+    private var telephonyManager: TelephonyManager? = null
+    private var recorder: CallRecorder? = null
 
-    private val callStateReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != TelephonyManager.ACTION_PHONE_STATE_CHANGED) return
-            val state = intent.getStringExtra(TelephonyManager.EXTRA_STATE) ?: return
-            when (state) {
-                TelephonyManager.EXTRA_STATE_OFFHOOK -> {
-                    prefs().edit().putBoolean("active_call_offhook", true).apply()
-                    saveLast("Call connected/offhook. Starting recording...")
-                    updateNotification("Call active. Recording in progress...")
-                    if (prefs().getBoolean("auto_recording_enabled", true)) {
-                        CallRecorder.start(this@CallPollingService)
-                    }
-                }
-                TelephonyManager.EXTRA_STATE_IDLE -> {
-                    val wasOffhook = prefs().getBoolean("active_call_offhook", false)
-                    val requestId = prefs().getInt("active_request_id", 0)
-                    if (wasOffhook && requestId > 0) {
-                        handleCallEnded("Phone returned idle")
-                    }
-                }
-            }
-        }
-    }
+    private var activeRequestId = 0
+    private var activeLeadId = 0
+    private var activePhone = ""
+    private var activeLeadName = ""
+    private var dialedAtMs = 0L
+    private var callStartedAtMs = 0L
+    private var callSeenOffhook = false
+    private var completing = false
 
     private val pollRunnable = object : Runnable {
         override fun run() {
-            if (isRunning && !polling) pollOnce()
-            val seconds = prefs().getInt("polling_seconds", 3).coerceAtLeast(3)
-            handler.postDelayed(this, seconds * 1000L)
+            pollNow("timer")
+            handler.postDelayed(this, POLL_MS)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        prefs = getSharedPreferences("crm_companion", Context.MODE_PRIVATE)
+        recorder = CallRecorder(this)
+        try { recorder?.ensureRecordingFolder() } catch (_: Exception) {}
         isRunning = true
-        createChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Waiting for CRM call request..."))
-        registerCallStateReceiver()
-        saveLast("Service started. Waiting for call request...")
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification("Waiting for CRM call button..."))
+        registerPhoneStateListener()
+        handler.removeCallbacks(pollRunnable)
         handler.post(pollRunnable)
+        setLastMessage("Calling service started. Fast real-time polling active.")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        isRunning = true
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_CHECK_NOW -> pollNow("force")
+            else -> pollNow("start")
+        }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        isRunning = false
         handler.removeCallbacksAndMessages(null)
-        unregisterCallStateReceiver()
+        try { telephonyManager?.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE) } catch (_: Exception) {}
+        try { recorder?.stop() } catch (_: Exception) {}
         executor.shutdownNow()
-        saveLast("Service stopped")
+        isRunning = false
+        setLastMessage("Calling service stopped")
         super.onDestroy()
     }
 
-    private fun pollOnce() {
-        polling = true
+    private fun pollNow(reason: String) {
+        if (!prefs.getBoolean("autoCallEnabled", true)) {
+            setLastMessage("Auto-call is OFF")
+            return
+        }
+
+        val crmUrl = prefs.getString("crmUrl", "") ?: ""
+        val userId = prefs.getInt("userId", 0)
+        val token = prefs.getString("token", "") ?: ""
+        if (crmUrl.isBlank() || userId <= 0 || token.isBlank()) {
+            setLastMessage("Waiting for valid mobile login/session")
+            return
+        }
+
+        retryPendingRecordingUploads()
+
+        if (activeRequestId > 0) {
+            inspectActiveCallState()
+            return
+        }
+
+        if (!polling.compareAndSet(false, true)) return
         executor.execute {
             try {
-                val p = prefs()
-                val crmUrl = (p.getString("crm_url", "") ?: "").trimEnd('/')
-                val token = p.getString("mobile_token", "") ?: ""
-                val userId = p.getInt("user_id", 0)
-                val autoCallEnabled = p.getBoolean("auto_call_enabled", true)
-                val autoRecordingEnabled = p.getBoolean("auto_recording_enabled", true)
-
-                if (crmUrl.isBlank() || token.isBlank() || userId <= 0) {
-                    saveLast("Missing CRM login session")
+                val url = "$crmUrl/api/get-call-request.php?user_id=$userId&token=${urlEncode(token)}&_=${System.currentTimeMillis()}"
+                val json = httpGet(url, token)
+                if (!json.optBoolean("success", false)) {
+                    setLastMessage(json.optString("message", "Waiting for web call button..."))
                     return@execute
                 }
-
-                val activeRequestId = p.getInt("active_request_id", 0)
-                val activeCompleted = p.getBoolean("active_call_completed", false)
-                if (activeRequestId > 0 && !activeCompleted) {
-                    saveLast("Active request #$activeRequestId running. Waiting for call end...")
+                val req = json.optJSONObject("request") ?: json.optJSONObject("data") ?: json
+                val reqId = req.optInt("id", req.optInt("request_id", 0))
+                val leadId = req.optInt("lead_id", 0)
+                val phone = req.optString("phone", "")
+                val leadName = req.optString("lead_name", "Lead")
+                if (reqId <= 0 || phone.isBlank()) {
+                    setLastMessage("Pending request missing id or phone")
                     return@execute
                 }
-
-                val url = "$crmUrl/api/get-call-request.php?user_id=$userId&token=${enc(token)}"
-                val body = httpGet(url, token)
-                val json = JSONObject(body)
-
-                if (json.optBoolean("success", false)) {
-                    val req = json.optJSONObject("request") ?: return@execute
-                    val requestId = req.optInt("id", 0)
-                    val leadId = req.optInt("lead_id", 0)
-                    val phone = req.optString("phone", "")
-                    val leadName = req.optString("lead_name", "Lead")
-
-                    if (requestId <= 0 || leadId <= 0 || phone.isBlank()) {
-                        saveLast("Invalid pending request received")
-                        return@execute
-                    }
-
-                    val lastStarted = p.getInt("last_started_request_id", 0)
-                    if (lastStarted == requestId) {
-                        saveLast("Already handled request #$requestId")
-                        return@execute
-                    }
-
-                    updateNotification("CRM request found: $leadName")
-                    saveLast("Pending request #$requestId found for $leadName $phone")
-
-                    val picked = updateStatus(crmUrl, token, userId, requestId, "picked", "Android app picked request and started mobile SIM call")
-                    if (!picked) {
-                        saveLast("Could not update picked status for #$requestId")
-                        return@execute
-                    }
-
-                    p.edit()
-                        .putInt("last_started_request_id", requestId)
-                        .putInt("active_request_id", requestId)
-                        .putInt("active_lead_id", leadId)
-                        .putString("active_lead_name", leadName)
-                        .putString("active_phone", phone)
-                        .putBoolean("active_call_offhook", false)
-                        .putBoolean("active_call_completed", false)
-                        .apply()
-
-                    CallRecorder.preparePending(this, crmUrl, token, userId, requestId, leadId, leadName, phone)
-
-                    if (autoCallEnabled) {
-                        val called = DirectCaller.makeCall(this, phone, requestId)
-                        if (called) {
-                            saveLast("Direct call started: $leadName $phone")
-                            updateNotification("Call started: $leadName")
-
-                            // Fallback: some devices do not send PHONE_STATE quickly for outgoing calls.
-                            if (autoRecordingEnabled) {
-                                handler.postDelayed({
-                                    val currentRequest = prefs().getInt("active_request_id", 0)
-                                    val completed = prefs().getBoolean("active_call_completed", false)
-                                    if (currentRequest == requestId && !completed && !CallRecorder.isRecording) {
-                                        saveLast("Starting recording fallback for request #$requestId")
-                                        CallRecorder.start(this)
-                                    }
-                                }, 4500L)
-                            }
-
-                            // Safety fallback: if phone state end event is blocked, complete after configured max minutes.
-                            val maxMinutes = prefs().getInt("max_recording_minutes", 30).coerceIn(1, 120)
-                            handler.postDelayed({
-                                val currentRequest = prefs().getInt("active_request_id", 0)
-                                val completed = prefs().getBoolean("active_call_completed", false)
-                                if (currentRequest == requestId && !completed) {
-                                    handleCallEnded("Max recording time reached")
-                                }
-                            }, maxMinutes * 60_000L)
-                        } else {
-                            updateStatus(crmUrl, token, userId, requestId, "failed", "Android blocked direct call or CALL_PHONE permission missing")
-                            clearActiveCall()
-                            saveLast("Direct call failed/blocked for #$requestId")
-                            updateNotification("Call failed/blocked. Open app and allow permission.")
-                        }
-                    } else {
-                        saveLast("Auto-call OFF. Request #$requestId picked but not called.")
-                        updateNotification("Auto-call OFF. Open app.")
-                    }
-                } else {
-                    val msg = json.optString("message", "No pending call request")
-                    if (!msg.lowercase().contains("no pending")) saveLast(msg)
-                    updateNotification("Waiting for CRM call request...")
-                }
+                handlePendingRequest(reqId, leadId, phone, leadName)
             } catch (e: Exception) {
-                saveLast("Polling error: ${e.message}")
-                updateNotification("CRM polling error. Check internet/login.")
+                val msg = e.message ?: e.toString()
+                if (msg.contains("No pending", ignoreCase = true)) {
+                    setLastMessage("Waiting for web call button...")
+                } else {
+                    setLastMessage("Poll failed: $msg")
+                }
             } finally {
-                polling = false
+                polling.set(false)
             }
         }
     }
 
-    private fun handleCallEnded(reason: String) {
-        if (endingCall) return
-        endingCall = true
-        executor.execute {
-            val p = prefs()
-            val crmUrl = (p.getString("active_crm_url", p.getString("crm_url", "") ?: "") ?: "").trimEnd('/')
-            val token = p.getString("active_token", p.getString("mobile_token", "") ?: "") ?: ""
-            val userId = p.getInt("active_user_id", p.getInt("user_id", 0))
-            val requestId = p.getInt("active_request_id", 0)
+    private fun handlePendingRequest(reqId: Int, leadId: Int, phone: String, leadName: String) {
+        if (activeRequestId > 0) return
+        activeRequestId = reqId
+        activeLeadId = leadId
+        activePhone = phone
+        activeLeadName = leadName
+        dialedAtMs = System.currentTimeMillis()
+        callStartedAtMs = 0L
+        callSeenOffhook = false
+        completing = false
+        prefs.edit()
+            .putInt("activeRequestId", reqId)
+            .putString("activeLeadName", leadName)
+            .putString("activePhone", phone)
+            .apply()
 
-            try {
-                if (requestId <= 0 || crmUrl.isBlank() || token.isBlank() || userId <= 0) {
-                    saveLast("Call ended but active request/session missing")
-                    return@execute
-                }
-
-                updateNotification("Call ended. Uploading recording...")
-                saveLast("Call ended for request #$requestId. $reason")
-
-                val recordingEnabled = p.getBoolean("auto_recording_enabled", true)
-                val uploadResult = if (recordingEnabled) {
-                    CallRecorder.stopAndUpload(this, "completed")
-                } else {
-                    CallRecorder.UploadResult(true, "Recording disabled", duration = "-")
-                }
-
-                val message = if (uploadResult.success) {
-                    "Call completed. ${uploadResult.message}"
-                } else {
-                    "Call completed. ${uploadResult.message}"
-                }
-
-                updateStatus(
-                    crmUrl,
-                    token,
-                    userId,
-                    requestId,
-                    "completed",
-                    message,
-                    duration = uploadResult.duration,
-                    notes = message,
-                    callStatus = "Completed"
-                )
-
-                p.edit()
-                    .putBoolean("active_call_completed", true)
-                    .putString("last_message", message)
-                    .apply()
-                updateNotification(message)
-                clearActiveCall()
-            } catch (e: Exception) {
-                saveLast("Call completion failed: ${e.message}")
-                updateNotification("Call completed but upload/status failed")
-            } finally {
-                endingCall = false
-            }
+        setLastMessage("Web request #$reqId received. Dialing $leadName")
+        updateRequest(reqId, "picked", "Android app picked request", "", "")
+        val launched = DirectCaller.call(this, phone, reqId)
+        if (!launched) {
+            savePendingFeedback(reqId, leadId, leadName, phone, "00:00:00", "Not Picked", "")
+            completeActiveCall("failed", "Dialer launch failed", "00:00:00", "Not Picked")
+            handler.postDelayed({ openAppForFeedback() }, 500L)
+            return
         }
+
+        handler.postDelayed({ inspectActiveCallState() }, 1200L)
     }
 
-    private fun updateStatus(
-        crmUrl: String,
-        token: String,
-        userId: Int,
-        requestId: Int,
-        status: String,
-        message: String,
-        duration: String = "",
-        notes: String = "",
-        callStatus: String = ""
-    ): Boolean {
-        return try {
-            val params = StringBuilder()
-                .append("user_id=").append(userId)
-                .append("&token=").append(enc(token))
-                .append("&request_id=").append(requestId)
-                .append("&status=").append(enc(status))
-                .append("&message=").append(enc(message))
-            if (duration.isNotBlank()) params.append("&duration=").append(enc(duration))
-            if (notes.isNotBlank()) params.append("&notes=").append(enc(notes))
-            if (callStatus.isNotBlank()) params.append("&call_status=").append(enc(callStatus))
-            val response = httpPost("$crmUrl/api/update-call-request.php", token, params.toString())
-            JSONObject(response).optBoolean("success", false)
+    private fun registerPhoneStateListener() {
+        telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+        phoneStateListener = object : PhoneStateListener() {
+            override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                super.onCallStateChanged(state, phoneNumber)
+                if (activeRequestId <= 0) return
+                when (state) {
+                    TelephonyManager.CALL_STATE_OFFHOOK -> onCallOffhook()
+                    TelephonyManager.CALL_STATE_IDLE -> {
+                        // Some devices send IDLE immediately after dialer launch. The watchdog decides whether it is real end.
+                        inspectActiveCallState(forceIdleEvent = true)
+                    }
+                    TelephonyManager.CALL_STATE_RINGING -> setLastMessage("Call ringing for request #$activeRequestId")
+                }
+            }
+        }
+        try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                telephonyManager?.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
+            } else {
+                setLastMessage("READ_PHONE_STATE permission missing. Allow phone permission for recording completion.")
+            }
         } catch (e: Exception) {
-            saveLast("Status update failed: ${e.message}")
-            false
+            setLastMessage("Phone state listener failed: ${e.message}")
         }
     }
 
-    private fun httpGet(urlText: String, token: String): String {
-        val con = (URL(urlText).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 15000
-            setRequestProperty("X-Mobile-Token", token)
-            setRequestProperty("Accept", "application/json")
+    private fun inspectActiveCallState(forceIdleEvent: Boolean = false) {
+        if (activeRequestId <= 0 || completing) return
+        val now = System.currentTimeMillis()
+        val waited = now - dialedAtMs
+        val state = getCallStateSafe()
+
+        if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+            onCallOffhook()
+            return
         }
-        return readConnection(con)
-    }
 
-    private fun httpPost(urlText: String, token: String, params: String): String {
-        val con = (URL(urlText).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 15000
-            readTimeout = 15000
-            doOutput = true
-            setRequestProperty("X-Mobile-Token", token)
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            setRequestProperty("Accept", "application/json")
+        if (state == TelephonyManager.CALL_STATE_IDLE) {
+            if (callSeenOffhook) {
+                onCallIdle()
+                return
+            }
+            // If call never reached OFFHOOK within timeout, reset it so next web click is never blocked.
+            if (waited > NO_START_TIMEOUT_MS || forceIdleEvent && waited > 8000L) {
+                try { recorder?.stop() } catch (_: Exception) {}
+                savePendingFeedback(activeRequestId, activeLeadId, activeLeadName, activePhone, "00:00:00", "Not Picked", "")
+                completeActiveCall("failed", "Call did not start or phone state was not detected", "00:00:00", "Not Picked")
+                handler.postDelayed({ openAppForFeedback() }, 500L)
+            }
+            return
         }
-        OutputStreamWriter(con.outputStream).use { it.write(params) }
-        return readConnection(con)
+
+        if (!callSeenOffhook && waited > NO_START_TIMEOUT_MS) {
+            try { recorder?.stop() } catch (_: Exception) {}
+            savePendingFeedback(activeRequestId, activeLeadId, activeLeadName, activePhone, "00:00:00", "Not Picked", "")
+            completeActiveCall("failed", "Call timeout before connection", "00:00:00", "Not Picked")
+            handler.postDelayed({ openAppForFeedback() }, 500L)
+        }
     }
 
-    private fun readConnection(con: HttpURLConnection): String {
-        val stream = if (con.responseCode in 200..299) con.inputStream else con.errorStream
-        return BufferedReader(stream.reader()).use { it.readText() }
+    private fun getCallStateSafe(): Int {
+        return try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                @Suppress("DEPRECATION")
+                telephonyManager?.callState ?: TelephonyManager.CALL_STATE_IDLE
+            } else {
+                TelephonyManager.CALL_STATE_IDLE
+            }
+        } catch (_: Exception) {
+            TelephonyManager.CALL_STATE_IDLE
+        }
     }
 
-    private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
-
-    private fun prefs() = getSharedPreferences("companion_prefs", Context.MODE_PRIVATE)
-
-    private fun saveLast(message: String) {
-        prefs().edit().putString("last_message", message).apply()
+    private fun onCallOffhook() {
+        if (activeRequestId <= 0 || completing) return
+        if (callStartedAtMs <= 0L) {
+            callStartedAtMs = System.currentTimeMillis()
+            callSeenOffhook = true
+            updateRequest(activeRequestId, "connected", "Call connected/offhook", "", "Connected")
+            if (prefs.getBoolean("autoRecordingEnabled", true)) {
+                recorder?.start(activeRequestId, activeLeadId)
+            }
+            setLastMessage("Call in progress for request #$activeRequestId")
+        }
     }
 
-    private fun clearActiveCall() {
-        prefs().edit()
-            .remove("active_request_id")
-            .remove("active_lead_id")
-            .remove("active_lead_name")
-            .remove("active_phone")
-            .remove("active_call_offhook")
-            .remove("active_call_completed")
-            .remove("active_recording_path")
-            .remove("active_recording_started_ms")
-            .remove("active_crm_url")
-            .remove("active_token")
-            .remove("active_user_id")
+    private fun onCallIdle() {
+        if (activeRequestId <= 0 || completing) return
+        if (!callSeenOffhook) {
+            inspectActiveCallState(forceIdleEvent = true)
+            return
+        }
+        completing = true
+        val durationMs = (System.currentTimeMillis() - callStartedAtMs).coerceAtLeast(0L)
+        val duration = formatDuration(durationMs)
+        val reqId = activeRequestId
+        val leadId = activeLeadId
+        executor.execute {
+            var recordingUrl = ""
+            var localFile: File? = null
+            try {
+                localFile = recorder?.stop()
+                if (localFile != null && prefs.getBoolean("autoRecordingEnabled", true)) {
+                    recordingUrl = recorder?.uploadRecording(
+                        prefs.getString("crmUrl", "") ?: "",
+                        prefs.getInt("userId", 0),
+                        prefs.getString("token", "") ?: "",
+                        reqId,
+                        leadId,
+                        localFile!!,
+                        duration
+                    ) ?: ""
+                    prefs.edit().putString("lastRecordingUrl", recordingUrl.ifBlank { "Uploaded, URL not returned" }).apply()
+                } else {
+                    prefs.edit().putString("lastRecordingUrl", "-").apply()
+                }
+            } catch (e: Exception) {
+                val fileToRetry = localFile
+                if (fileToRetry != null && fileToRetry.exists()) {
+                    enqueuePendingRecordingUpload(reqId, leadId, fileToRetry.absolutePath, duration, e.message ?: e.toString())
+                    prefs.edit().putString("lastRecordingUrl", "Upload pending retry").apply()
+                    setLastMessage("Recording upload failed. Saved locally and queued for retry: ${e.message}")
+                } else {
+                    setLastMessage("Recording upload failed: ${e.message}")
+                }
+            } finally {
+                savePendingFeedback(reqId, leadId, activeLeadName, activePhone, duration, "Connected", recordingUrl)
+                completeActiveCall("completed", "Mobile call completed${if (recordingUrl.isNotBlank()) " with recording" else ""}", duration, "Connected")
+                handler.postDelayed({ openAppForFeedback() }, 500L)
+            }
+        }
+    }
+
+    private fun completeActiveCall(status: String, message: String, duration: String, callStatus: String) {
+        val reqId = activeRequestId
+        if (reqId <= 0) return
+        updateRequest(reqId, status, message, duration, callStatus)
+        setLastMessage("Request #$reqId $status. Duration: $duration")
+        activeRequestId = 0
+        activeLeadId = 0
+        activePhone = ""
+        activeLeadName = ""
+        dialedAtMs = 0L
+        callStartedAtMs = 0L
+        callSeenOffhook = false
+        completing = false
+        prefs.edit()
+            .remove("activeRequestId")
+            .remove("activeLeadName")
+            .remove("activePhone")
+            .apply()
+        handler.postDelayed({ pollNow("after_complete") }, 400L)
+    }
+
+    private fun savePendingFeedback(
+        requestId: Int,
+        leadId: Int,
+        leadName: String,
+        phone: String,
+        duration: String,
+        callStatus: String,
+        recordingUrl: String
+    ) {
+        val eventId = "${requestId}-${System.currentTimeMillis()}"
+        val autoNotes = buildString {
+            if (callStatus.equals("Connected", ignoreCase = true)) {
+                append("Call completed from mobile app.")
+            } else {
+                append("Call not connected / not picked from mobile app.")
+            }
+            if (leadName.isNotBlank()) append("\nLead: ").append(leadName)
+            if (phone.isNotBlank()) append("\nPhone: ").append(phone)
+            append("\nDuration: ").append(duration)
+            if (recordingUrl.isNotBlank()) append("\nRecording: ").append(recordingUrl)
+            append("\n\nDiscussion notes: ")
+        }
+        prefs.edit()
+            .putBoolean("pendingFeedback", true)
+            .putString("pendingFeedbackEventId", eventId)
+            .putInt("pendingFeedbackRequestId", requestId)
+            .putInt("pendingFeedbackLeadId", leadId)
+            .putString("pendingFeedbackLeadName", leadName)
+            .putString("pendingFeedbackPhone", phone)
+            .putString("pendingFeedbackDuration", duration)
+            .putString("pendingFeedbackCallStatus", callStatus)
+            .putString("pendingFeedbackRecordingUrl", recordingUrl)
+            .putString("pendingFeedbackNotes", autoNotes)
+            .putLong("pendingFeedbackCreatedAt", System.currentTimeMillis())
             .apply()
     }
 
-    private fun registerCallStateReceiver() {
-        if (receiverRegistered) return
+    private fun openAppForFeedback() {
         try {
-            val filter = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(callStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("DEPRECATION")
-                registerReceiver(callStateReceiver, filter)
-            }
-            receiverRegistered = true
+            val intent = packageManager.getLaunchIntentForPackage(packageName) ?: return
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            intent.putExtra("open_feedback", true)
+            startActivity(intent)
+            setLastMessage("Call ended. Feedback form opened.")
         } catch (e: Exception) {
-            saveLast("Call state receiver failed: ${e.message}")
+            setLastMessage("Call ended. Open app Feedback tab. ${e.message ?: ""}")
         }
     }
 
-    private fun unregisterCallStateReceiver() {
-        if (!receiverRegistered) return
-        try { unregisterReceiver(callStateReceiver) } catch (_: Exception) {}
-        receiverRegistered = false
+
+    private fun enqueuePendingRecordingUpload(requestId: Int, leadId: Int, filePath: String, duration: String, error: String) {
+        try {
+            val queue = JSONArray(prefs.getString("pendingRecordingUploads", "[]") ?: "[]")
+            val item = JSONObject().apply {
+                put("request_id", requestId)
+                put("lead_id", leadId)
+                put("file_path", filePath)
+                put("duration", duration)
+                put("attempts", 0)
+                put("last_error", error)
+                put("created_at", System.currentTimeMillis())
+            }
+            queue.put(item)
+            prefs.edit()
+                .putString("pendingRecordingUploads", queue.toString())
+                .putInt("pendingRecordingUploadCount", queue.length())
+                .apply()
+        } catch (_: Exception) {}
     }
 
-    private fun createChannel() {
+    private fun retryPendingRecordingUploads() {
+        if (!uploadRetrying.compareAndSet(false, true)) return
+        executor.execute {
+            try {
+                val raw = prefs.getString("pendingRecordingUploads", "[]") ?: "[]"
+                val queue = JSONArray(raw)
+                if (queue.length() == 0) return@execute
+                val crmUrl = prefs.getString("crmUrl", "") ?: ""
+                val userId = prefs.getInt("userId", 0)
+                val token = prefs.getString("token", "") ?: ""
+                if (crmUrl.isBlank() || userId <= 0 || token.isBlank()) return@execute
+
+                val remaining = JSONArray()
+                for (i in 0 until queue.length()) {
+                    val item = queue.optJSONObject(i) ?: continue
+                    val requestId = item.optInt("request_id", 0)
+                    val leadId = item.optInt("lead_id", 0)
+                    val filePath = item.optString("file_path", "")
+                    val duration = item.optString("duration", "")
+                    val file = File(filePath)
+                    if (requestId <= 0 || leadId <= 0 || !file.exists() || file.length() <= 64) continue
+                    try {
+                        val uploadedUrl = recorder?.uploadRecording(crmUrl, userId, token, requestId, leadId, file, duration) ?: ""
+                        prefs.edit().putString("lastRecordingUrl", uploadedUrl.ifBlank { "Uploaded on retry" }).apply()
+                        setLastMessage("Pending recording uploaded for request #$requestId")
+                    } catch (e: Exception) {
+                        item.put("attempts", item.optInt("attempts", 0) + 1)
+                        item.put("last_error", e.message ?: e.toString())
+                        item.put("last_attempt_at", System.currentTimeMillis())
+                        remaining.put(item)
+                    }
+                }
+                prefs.edit()
+                    .putString("pendingRecordingUploads", remaining.toString())
+                    .putInt("pendingRecordingUploadCount", remaining.length())
+                    .apply()
+            } catch (e: Exception) {
+                setLastMessage("Recording retry failed: ${e.message}")
+            } finally {
+                uploadRetrying.set(false)
+            }
+        }
+    }
+
+    private fun updateRequest(requestId: Int, status: String, message: String, duration: String, callStatus: String) {
+        try {
+            val crmUrl = prefs.getString("crmUrl", "") ?: return
+            val token = prefs.getString("token", "") ?: return
+            val userId = prefs.getInt("userId", 0)
+            val body = JSONObject().apply {
+                put("user_id", userId)
+                put("token", token)
+                put("request_id", requestId)
+                put("status", status)
+                put("message", message)
+                if (duration.isNotBlank()) put("duration", duration)
+                if (callStatus.isNotBlank()) put("call_status", callStatus)
+            }.toString()
+            httpPostJson("$crmUrl/api/update-call-request.php", body, token)
+        } catch (e: Exception) {
+            setLastMessage("Update request failed: ${e.message}")
+        }
+    }
+
+    private fun httpGet(url: String, token: String): JSONObject {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 3500
+            readTimeout = 4500
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Cache-Control", "no-cache")
+            setRequestProperty("X-Mobile-Token", token)
+        }
+        val text = readResponse(conn)
+        if (conn.responseCode !in 200..299) throw Exception("HTTP ${conn.responseCode}: $text")
+        return JSONObject(text)
+    }
+
+    private fun httpPostJson(url: String, jsonBody: String, token: String): JSONObject {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 3500
+            readTimeout = 4500
+            doOutput = true
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("X-Mobile-Token", token)
+        }
+        OutputStreamWriter(conn.outputStream).use { it.write(jsonBody) }
+        val text = readResponse(conn)
+        if (conn.responseCode !in 200..299) throw Exception("HTTP ${conn.responseCode}: $text")
+        return JSONObject(text)
+    }
+
+    private fun readResponse(conn: HttpURLConnection): String {
+        val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+        return if (stream != null) BufferedReader(stream.reader()).use { it.readText() } else ""
+    }
+
+    private fun urlEncode(value: String) = URLEncoder.encode(value, "UTF-8")
+
+    private fun formatDuration(ms: Long): String {
+        val total = (ms / 1000L).toInt()
+        val h = total / 3600
+        val m = (total % 3600) / 60
+        val s = total % 60
+        return "%02d:%02d:%02d".format(h, m, s)
+    }
+
+    private fun setLastMessage(message: String) {
+        prefs.edit().putString("lastMessage", message).apply()
+        updateNotification(message)
+    }
+
+    private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "CRM Call Companion",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            channel.description = "Keeps CRM mobile calling and recording service active"
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            val channel = NotificationChannel(CHANNEL_ID, "CRM Calling Service", NotificationManager.IMPORTANCE_LOW)
+            channel.description = "Keeps Click Connect CRM web call sync active"
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val openIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-        @Suppress("DEPRECATION")
-        return builder
+    private fun buildNotification(message: String): Notification {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val pendingIntent = PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Click Connect CRM Calling Active")
+            .setContentText(message)
             .setSmallIcon(android.R.drawable.sym_action_call)
-            .setContentTitle("CRM Auto-Call Active")
-            .setContentText(text)
-            .setOngoing(true)
             .setContentIntent(pendingIntent)
-            .setPriority(Notification.PRIORITY_LOW)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
-    private fun updateNotification(text: String) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, buildNotification(text))
+    private fun updateNotification(message: String) {
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, buildNotification(message))
+        } catch (_: Exception) {}
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "crm_calling_service"
+        private const val NOTIFICATION_ID = 101
+        private const val POLL_MS = 350L
+        private const val NO_START_TIMEOUT_MS = 9000L
+        private const val ACTION_START = "com.clickconnect.crm_companion.START"
+        private const val ACTION_CHECK_NOW = "com.clickconnect.crm_companion.CHECK_NOW"
+        private const val ACTION_STOP = "com.clickconnect.crm_companion.STOP"
+        @Volatile var isRunning: Boolean = false
+
+        fun start(context: Context, checkNow: Boolean = false) {
+            val intent = Intent(context, CallPollingService::class.java).apply { action = if (checkNow) ACTION_CHECK_NOW else ACTION_START }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent)
+        }
+
+        fun stop(context: Context) {
+            context.startService(Intent(context, CallPollingService::class.java).apply { action = ACTION_STOP })
+        }
     }
 }
