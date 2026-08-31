@@ -10,7 +10,7 @@ class VerifiedCallTrackingScreen extends StatelessWidget {
     final activeLead = lead ?? (app.leads.isNotEmpty ? app.leads.first : demoLeads.first);
     return BrandedScaffold(
       title: 'Verified Call Tracking',
-      actions: [IconButton.filled(icon: const Icon(Icons.call_end_rounded), color: Colors.white, style: IconButton.styleFrom(backgroundColor: CcColors.red), onPressed: () => context.open(AutoFeedbackScreen(lead: activeLead)))],
+      actions: const [],
       child: AnimatedBuilder(
         animation: app,
         builder: (context, _) => Column(
@@ -27,7 +27,7 @@ class VerifiedCallTrackingScreen extends StatelessWidget {
               const CcChip(label: 'Call in Progress / Recent Call', color: CcColors.green, filled: true),
               const SizedBox(height: 18),
               const Text('Live', style: TextStyle(fontSize: 40, fontWeight: FontWeight.w900)),
-              const Text('Native service will update call proof after call end', style: TextStyle(color: CcColors.textMuted)),
+              const Text('Native service will update CRM after call end. Feedback opens only on Web CRM.', style: TextStyle(color: CcColors.textMuted)),
             ])),
             const SizedBox(height: 12),
             GlassCard(child: Column(children: [
@@ -40,15 +40,14 @@ class VerifiedCallTrackingScreen extends StatelessWidget {
               KeyValueRow('Recording Status', app.autoRecordingEnabled ? 'Enabled / pending upload' : 'Disabled', icon: Icons.fiber_manual_record_rounded, valueColor: app.autoRecordingEnabled ? CcColors.red : CcColors.amber),
               KeyValueRow('Sync Status', app.statusMessage, icon: Icons.sync_rounded, valueColor: CcColors.green),
               const KeyValueRow('Call Via', 'Click Connect AI CRM', icon: Icons.verified_rounded, valueColor: CcColors.blue300),
+              const KeyValueRow('Feedback', 'Web CRM only', icon: Icons.web_rounded, valueColor: CcColors.blue300),
               KeyValueRow('CRM URL', app.baseUrl, icon: Icons.language_rounded),
             ])),
             const SizedBox(height: 12),
             GlassCard(
               gradient: LinearGradient(colors: [CcColors.blue600.withValues(alpha: .22), CcColors.green.withValues(alpha: .12)]),
-              child: const Row(children: [Icon(Icons.shield_rounded, color: CcColors.green), SizedBox(width: 10), Expanded(child: Text('This app call will be tracked by native call service and submitted to CRM using user token and device ID.', style: TextStyle(color: CcColors.textSoft, height: 1.35)))]),
+              child: const Row(children: [Icon(Icons.shield_rounded, color: CcColors.green), SizedBox(width: 10), Expanded(child: Text('This app only initiates and monitors calls. Post-call feedback is handled on Web CRM automatically.', style: TextStyle(color: CcColors.textSoft, height: 1.35)))]),
             ),
-            const SizedBox(height: 12),
-            PrimaryButton(label: 'Open Feedback', icon: Icons.assignment_turned_in_rounded, color: CcColors.red, onPressed: () => context.open(AutoFeedbackScreen(lead: activeLead))),
           ],
         ),
       ),

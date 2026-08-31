@@ -1,7 +1,7 @@
 part of '../../../click_connect_ai_crm_ui.dart';
 
 class ApiConfig {
-  static const String defaultBaseUrl = 'https://test.clickconnectmedia.cloud';
+  static const String defaultBaseUrl = 'https://lawngreen-rat-215551.hostingersite.com';
 
   static String normalizeBaseUrl(String value) {
     var url = value.trim();

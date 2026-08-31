@@ -30,7 +30,7 @@ class CrmAppState extends ChangeNotifier {
   String lastNativeMessage = '-';
   String lastRecordingPath = '-';
   String lastRecordingUrl = '-';
-  String recordingFolderPath = '-';
+  String lastRecordingFolder = 'Music/ClickConnectCRM/CallRecordings';
 
   Map<String, dynamic> dashboard = <String, dynamic>{};
   List<Lead> leads = <Lead>[];
@@ -68,13 +68,12 @@ class CrmAppState extends ChangeNotifier {
     baseUrl = ApiConfig.normalizeBaseUrl(baseUrl);
     autoCallEnabled = await store.getAutoCall();
     autoRecordingEnabled = await store.getAutoRecording();
-    feedbackQueueCount = await store.feedbackQueueCount();
+    feedbackQueueCount = 0;
     session = await store.loadSession();
     if (session != null) baseUrl = session!.baseUrl;
     initialized = true;
     notifyListeners();
     if (session != null) {
-      recordingFolderPath = await native.ensureRecordingFolder();
       await ensureRealtimeCallSync(reason: 'saved_login_restore');
       _startCallingWatchers();
       statusMessage = serviceRunning
@@ -126,7 +125,6 @@ class CrmAppState extends ChangeNotifier {
         deviceName: deviceName,
       );
       await store.saveSession(session!);
-      recordingFolderPath = await native.ensureRecordingFolder();
       await ensureRealtimeCallSync(reason: 'login');
       _startCallingWatchers();
       statusMessage = serviceRunning ? 'Login successful. Real-time web calling sync is active.' : 'Login successful. Start calling service from Calling tab.';
@@ -398,7 +396,7 @@ class CrmAppState extends ChangeNotifier {
         statusMessage = 'Feedback synced with CRM';
       } catch (e) {
         await store.enqueueFeedback(payload);
-        feedbackQueueCount = await store.feedbackQueueCount();
+        feedbackQueueCount = 0;
         statusMessage = 'Feedback saved locally. Network aate hi auto-sync hoga. Pending: $feedbackQueueCount';
         error = null;
       }
@@ -423,43 +421,18 @@ class CrmAppState extends ChangeNotifier {
       await api.postForm(baseUrl, ApiConfig.callFeedback, payload, token: token);
     }
   }
-
   void _startFeedbackQueueTimer() {
+    // Mobile feedback workflow removed. Feedback is collected only on Web CRM.
     _feedbackSyncTimer?.cancel();
-    if (!isLoggedIn) return;
-    _feedbackSyncTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-      if (isLoggedIn) unawaited(syncQueuedFeedbacks(silent: true));
-    });
-    unawaited(syncQueuedFeedbacks(silent: true));
+    _feedbackSyncTimer = null;
+    feedbackQueueCount = 0;
   }
 
   Future<void> syncQueuedFeedbacks({bool silent = false}) async {
-    if (!isLoggedIn) return;
-    final queue = await store.loadFeedbackQueue();
-    if (queue.isEmpty) {
-      if (feedbackQueueCount != 0) {
-        feedbackQueueCount = 0;
-        if (!silent) notifyListeners();
-      }
-      return;
-    }
-    final remaining = <Map<String, dynamic>>[];
-    for (final payload in queue) {
-      try {
-        final withAuth = <String, dynamic>{...payload, 'user_id': userId, 'token': token};
-        await _sendFeedbackPayload(withAuth);
-      } catch (_) {
-        remaining.add(payload);
-      }
-    }
-    await store.saveFeedbackQueue(remaining);
-    feedbackQueueCount = remaining.length;
-    if (remaining.isEmpty) {
-      statusMessage = 'All pending feedback synced with CRM';
-    } else if (!silent) {
-      statusMessage = 'Feedback pending sync: ${remaining.length}. Network/DNS check karo.';
-    }
-    if (!silent || remaining.isEmpty) notifyListeners();
+    // Mobile feedback queue disabled. Web CRM owns post-call feedback.
+    await store.saveFeedbackQueue(const <Map<String, dynamic>>[]);
+    feedbackQueueCount = 0;
+    if (!silent) notifyListeners();
   }
 
   String _buildFeedbackNotes({
@@ -540,33 +513,23 @@ class CrmAppState extends ChangeNotifier {
     final oldMessage = lastNativeMessage;
     final oldPath = lastRecordingPath;
     final oldUrl = lastRecordingUrl;
-    final oldFolderPath = recordingFolderPath;
-    final oldSerial = pendingFeedbackSerial;
+    final oldFolder = lastRecordingFolder;
 
     serviceRunning = await native.isServiceRunning();
     lastNativeMessage = await native.lastMessage();
     lastRecordingPath = await native.lastRecordingPath();
     lastRecordingUrl = await native.lastRecordingUrl();
-    recordingFolderPath = await native.recordingFolderPath();
-    final pending = await native.pendingFeedback();
-    if (pending != null && _int(pending['request_id']) > 0) {
-      final eventId = _text(pending['event_id'], '${pending['request_id']}-${pending['created_at']}');
-      pendingFeedback = pending;
-      activeCallRequestId = _int(pending['request_id']);
-      activeCallRequest = pending;
-      if (eventId != _lastPendingFeedbackEventId) {
-        _lastPendingFeedbackEventId = eventId;
-        pendingFeedbackSerial++;
-        statusMessage = 'Call ended. Feedback form ready for request #${pending['request_id']}';
-      }
-    }
+    lastRecordingFolder = await native.lastRecordingFolder();
+    // Mobile app no longer opens or stores any feedback form.
+    pendingFeedback = null;
+    pendingFeedbackSerial = 0;
+    _lastPendingFeedbackEventId = '';
 
     final changed = oldService != serviceRunning ||
         oldMessage != lastNativeMessage ||
         oldPath != lastRecordingPath ||
         oldUrl != lastRecordingUrl ||
-        oldFolderPath != recordingFolderPath ||
-        oldSerial != pendingFeedbackSerial;
+        oldFolder != lastRecordingFolder;
     if (changed) notifyListeners();
   }
 
@@ -659,7 +622,6 @@ class CrmAppState extends ChangeNotifier {
     if (!isLoggedIn) return;
     if (!_permissionsRequested || reason.contains('login') || reason.contains('manual')) {
       await native.requestRequiredPermissions();
-      recordingFolderPath = await native.ensureRecordingFolder();
       _permissionsRequested = true;
     }
     await _syncNativeSession(startService: true);

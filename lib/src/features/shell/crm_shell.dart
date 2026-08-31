@@ -11,8 +11,6 @@ class CrmShell extends StatefulWidget {
 
 class _CrmShellState extends State<CrmShell> {
   int index = 0;
-  int _lastOpenedFeedbackSerial = 0;
-  bool _feedbackRouteOpen = false;
 
   @override
   void initState() {
@@ -23,23 +21,6 @@ class _CrmShellState extends State<CrmShell> {
       unawaited(app.ensureRealtimeCallSync(reason: 'shell_start'));
     });
   }
-
-  void _openFeedbackIfNeeded(CrmAppState app) {
-    if (app.pendingFeedbackSerial <= 0 || app.pendingFeedbackSerial == _lastOpenedFeedbackSerial || _feedbackRouteOpen) return;
-    _lastOpenedFeedbackSerial = app.pendingFeedbackSerial;
-    _feedbackRouteOpen = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Call ended. Feedback form auto-opened.')),
-      );
-      await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const CallFeedbackScreen(openedFromCall: true)),
-      );
-      if (mounted) _feedbackRouteOpen = false;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     final app = CrmScope.of(context);
@@ -51,7 +32,6 @@ class _CrmShellState extends State<CrmShell> {
     return AnimatedBuilder(
       animation: app,
       builder: (context, _) {
-        _openFeedbackIfNeeded(app);
         return Scaffold(
         backgroundColor: CcColors.navy950,
         body: IndexedStack(index: index, children: pages),

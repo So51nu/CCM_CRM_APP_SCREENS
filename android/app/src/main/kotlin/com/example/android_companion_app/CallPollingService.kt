@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -19,14 +20,12 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.io.BufferedReader
-import java.io.File
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import org.json.JSONArray
 import org.json.JSONObject
 
 class CallPollingService : Service() {
@@ -34,10 +33,13 @@ class CallPollingService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private val polling = AtomicBoolean(false)
-    private val uploadRetrying = AtomicBoolean(false)
     private var phoneStateListener: PhoneStateListener? = null
     private var telephonyManager: TelephonyManager? = null
     private var recorder: CallRecorder? = null
+    private var audioManager: AudioManager? = null
+    private var speakerModeApplied = false
+    private var originalSpeakerphone = false
+    private var originalAudioMode = AudioManager.MODE_NORMAL
 
     private var activeRequestId = 0
     private var activeLeadId = 0
@@ -59,7 +61,7 @@ class CallPollingService : Service() {
         super.onCreate()
         prefs = getSharedPreferences("crm_companion", Context.MODE_PRIVATE)
         recorder = CallRecorder(this)
-        try { recorder?.ensureRecordingFolder() } catch (_: Exception) {}
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         isRunning = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Waiting for CRM call button..."))
@@ -87,6 +89,7 @@ class CallPollingService : Service() {
         handler.removeCallbacksAndMessages(null)
         try { telephonyManager?.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE) } catch (_: Exception) {}
         try { recorder?.stop() } catch (_: Exception) {}
+        restoreSpeakerCaptureMode()
         executor.shutdownNow()
         isRunning = false
         setLastMessage("Calling service stopped")
@@ -107,7 +110,7 @@ class CallPollingService : Service() {
             return
         }
 
-        retryPendingRecordingUploads()
+        retryPendingRecordingUpload()
 
         if (activeRequestId > 0) {
             inspectActiveCallState()
@@ -249,13 +252,49 @@ class CallPollingService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun enableSpeakerCaptureMode() {
+        if (!prefs.getBoolean("speakerCaptureMode", true) || speakerModeApplied) return
+        try {
+            val audio = audioManager ?: return
+            originalSpeakerphone = audio.isSpeakerphoneOn
+            originalAudioMode = audio.mode
+            // This does not bypass Android call-recording restrictions. It only makes the far-end
+            // voice audible from loudspeaker so the microphone source has a chance to capture it.
+            audio.mode = AudioManager.MODE_IN_CALL
+            audio.isSpeakerphoneOn = true
+            speakerModeApplied = true
+            prefs.edit()
+                .putBoolean("speakerCaptureModeApplied", true)
+                .putString("lastMessage", "Speaker Capture mode ON: call audio may record through microphone.")
+                .apply()
+        } catch (e: Exception) {
+            prefs.edit().putString("lastMessage", "Speaker Capture mode failed: ${e.message}").apply()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun restoreSpeakerCaptureMode() {
+        if (!speakerModeApplied) return
+        try {
+            val audio = audioManager ?: return
+            audio.isSpeakerphoneOn = originalSpeakerphone
+            audio.mode = originalAudioMode
+        } catch (_: Exception) {
+        } finally {
+            speakerModeApplied = false
+            prefs.edit().remove("speakerCaptureModeApplied").apply()
+        }
+    }
+
     private fun onCallOffhook() {
         if (activeRequestId <= 0 || completing) return
         if (callStartedAtMs <= 0L) {
             callStartedAtMs = System.currentTimeMillis()
             callSeenOffhook = true
-            updateRequest(activeRequestId, "connected", "Call connected/offhook", "", "Connected")
+            updateRequest(activeRequestId, "connected", "Receiver picked / call connected", "", "Connected")
             if (prefs.getBoolean("autoRecordingEnabled", true)) {
+                enableSpeakerCaptureMode()
                 recorder?.start(activeRequestId, activeLeadId)
             }
             setLastMessage("Call in progress for request #$activeRequestId")
@@ -275,34 +314,43 @@ class CallPollingService : Service() {
         val leadId = activeLeadId
         executor.execute {
             var recordingUrl = ""
-            var localFile: File? = null
+            var recordingNote = ""
             try {
-                localFile = recorder?.stop()
-                if (localFile != null && prefs.getBoolean("autoRecordingEnabled", true)) {
-                    recordingUrl = recorder?.uploadRecording(
-                        prefs.getString("crmUrl", "") ?: "",
-                        prefs.getInt("userId", 0),
-                        prefs.getString("token", "") ?: "",
-                        reqId,
-                        leadId,
-                        localFile!!,
-                        duration
-                    ) ?: ""
-                    prefs.edit().putString("lastRecordingUrl", recordingUrl.ifBlank { "Uploaded, URL not returned" }).apply()
+                val result = recorder?.stop()
+                if (result != null && prefs.getBoolean("autoRecordingEnabled", true)) {
+                    recordingNote = result.message
+                    if (result.isValid && result.uploadFile != null) {
+                        try {
+                            recordingUrl = recorder?.uploadRecording(
+                                prefs.getString("crmUrl", "") ?: "",
+                                prefs.getInt("userId", 0),
+                                prefs.getString("token", "") ?: "",
+                                reqId,
+                                leadId,
+                                result.uploadFile,
+                                duration,
+                                result.publicPath,
+                                result.publicUri,
+                                result.maxAmplitude
+                            ) ?: ""
+                            prefs.edit().putString("lastRecordingUrl", recordingUrl.ifBlank { "Uploaded, URL not returned" }).apply()
+                        } catch (uploadError: Exception) {
+                            savePendingRecordingUpload(reqId, leadId, result.uploadFile.absolutePath, duration, result.publicPath, result.publicUri)
+                            prefs.edit().putString("lastRecordingUrl", "Upload pending: ${uploadError.message}").apply()
+                            recordingNote = "${result.message}\nUpload pending: ${uploadError.message}"
+                        }
+                    } else {
+                        prefs.edit().putString("lastRecordingUrl", "Recording not uploaded: ${result?.message ?: "No valid audio file"}").apply()
+                    }
                 } else {
                     prefs.edit().putString("lastRecordingUrl", "-").apply()
                 }
             } catch (e: Exception) {
-                val fileToRetry = localFile
-                if (fileToRetry != null && fileToRetry.exists()) {
-                    enqueuePendingRecordingUpload(reqId, leadId, fileToRetry.absolutePath, duration, e.message ?: e.toString())
-                    prefs.edit().putString("lastRecordingUrl", "Upload pending retry").apply()
-                    setLastMessage("Recording upload failed. Saved locally and queued for retry: ${e.message}")
-                } else {
-                    setLastMessage("Recording upload failed: ${e.message}")
-                }
+                setLastMessage("Recording save/upload failed: ${e.message}")
+                recordingNote = "Recording save/upload failed: ${e.message}"
             } finally {
-                savePendingFeedback(reqId, leadId, activeLeadName, activePhone, duration, "Connected", recordingUrl)
+                restoreSpeakerCaptureMode()
+                savePendingFeedback(reqId, leadId, activeLeadName, activePhone, duration, "Connected", recordingUrl, recordingNote)
                 completeActiveCall("completed", "Mobile call completed${if (recordingUrl.isNotBlank()) " with recording" else ""}", duration, "Connected")
                 handler.postDelayed({ openAppForFeedback() }, 500L)
             }
@@ -313,6 +361,7 @@ class CallPollingService : Service() {
         val reqId = activeRequestId
         if (reqId <= 0) return
         updateRequest(reqId, status, message, duration, callStatus)
+        restoreSpeakerCaptureMode()
         setLastMessage("Request #$reqId $status. Duration: $duration")
         activeRequestId = 0
         activeLeadId = 0
@@ -330,6 +379,71 @@ class CallPollingService : Service() {
         handler.postDelayed({ pollNow("after_complete") }, 400L)
     }
 
+    private fun savePendingRecordingUpload(requestId: Int, leadId: Int, filePath: String, duration: String, publicPath: String, publicUri: String) {
+        prefs.edit()
+            .putBoolean("pendingRecordingUpload", true)
+            .putInt("pendingRecordingRequestId", requestId)
+            .putInt("pendingRecordingLeadId", leadId)
+            .putString("pendingRecordingFilePath", filePath)
+            .putString("pendingRecordingDuration", duration)
+            .putString("pendingRecordingPublicPath", publicPath)
+            .putString("pendingRecordingPublicUri", publicUri)
+            .putLong("pendingRecordingCreatedAt", System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun clearPendingRecordingUpload() {
+        prefs.edit()
+            .remove("pendingRecordingUpload")
+            .remove("pendingRecordingRequestId")
+            .remove("pendingRecordingLeadId")
+            .remove("pendingRecordingFilePath")
+            .remove("pendingRecordingDuration")
+            .remove("pendingRecordingPublicPath")
+            .remove("pendingRecordingPublicUri")
+            .remove("pendingRecordingCreatedAt")
+            .apply()
+    }
+
+    private fun retryPendingRecordingUpload() {
+        if (!prefs.getBoolean("pendingRecordingUpload", false)) return
+        if (!polling.compareAndSet(false, true)) return
+        executor.execute {
+            try {
+                val filePath = prefs.getString("pendingRecordingFilePath", "") ?: ""
+                val file = java.io.File(filePath)
+                if (!file.exists() || file.length() < 1024L) {
+                    setLastMessage("Pending recording missing/empty, retry cancelled")
+                    clearPendingRecordingUpload()
+                    return@execute
+                }
+                val reqId = prefs.getInt("pendingRecordingRequestId", 0)
+                val leadId = prefs.getInt("pendingRecordingLeadId", 0)
+                val duration = prefs.getString("pendingRecordingDuration", "") ?: ""
+                val publicPath = prefs.getString("pendingRecordingPublicPath", "") ?: ""
+                val publicUri = prefs.getString("pendingRecordingPublicUri", "") ?: ""
+                val url = recorder?.uploadRecording(
+                    prefs.getString("crmUrl", "") ?: "",
+                    prefs.getInt("userId", 0),
+                    prefs.getString("token", "") ?: "",
+                    reqId,
+                    leadId,
+                    file,
+                    duration,
+                    publicPath,
+                    publicUri,
+                    prefs.getInt("lastRecordingMaxAmplitude", 0)
+                ) ?: ""
+                prefs.edit().putString("lastRecordingUrl", url.ifBlank { "Uploaded" }).apply()
+                clearPendingRecordingUpload()
+                setLastMessage("Pending recording uploaded to CRM")
+            } catch (e: Exception) {
+                setLastMessage("Pending recording upload retry failed: ${e.message}")
+            } finally {
+                polling.set(false)
+            }
+        }
+    }
     private fun savePendingFeedback(
         requestId: Int,
         leadId: Int,
@@ -337,111 +451,32 @@ class CallPollingService : Service() {
         phone: String,
         duration: String,
         callStatus: String,
-        recordingUrl: String
+        recordingUrl: String,
+        recordingNote: String = ""
     ) {
-        val eventId = "${requestId}-${System.currentTimeMillis()}"
-        val autoNotes = buildString {
-            if (callStatus.equals("Connected", ignoreCase = true)) {
-                append("Call completed from mobile app.")
-            } else {
-                append("Call not connected / not picked from mobile app.")
-            }
-            if (leadName.isNotBlank()) append("\nLead: ").append(leadName)
-            if (phone.isNotBlank()) append("\nPhone: ").append(phone)
-            append("\nDuration: ").append(duration)
-            if (recordingUrl.isNotBlank()) append("\nRecording: ").append(recordingUrl)
-            append("\n\nDiscussion notes: ")
-        }
-        prefs.edit()
-            .putBoolean("pendingFeedback", true)
-            .putString("pendingFeedbackEventId", eventId)
-            .putInt("pendingFeedbackRequestId", requestId)
-            .putInt("pendingFeedbackLeadId", leadId)
-            .putString("pendingFeedbackLeadName", leadName)
-            .putString("pendingFeedbackPhone", phone)
-            .putString("pendingFeedbackDuration", duration)
-            .putString("pendingFeedbackCallStatus", callStatus)
-            .putString("pendingFeedbackRecordingUrl", recordingUrl)
-            .putString("pendingFeedbackNotes", autoNotes)
-            .putLong("pendingFeedbackCreatedAt", System.currentTimeMillis())
-            .apply()
+        // Mobile feedback workflow removed. The backend marks web feedback pending after updateRequest().
+        clearPendingFeedbackPrefs()
     }
 
     private fun openAppForFeedback() {
-        try {
-            val intent = packageManager.getLaunchIntentForPackage(packageName) ?: return
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            intent.putExtra("open_feedback", true)
-            startActivity(intent)
-            setLastMessage("Call ended. Feedback form opened.")
-        } catch (e: Exception) {
-            setLastMessage("Call ended. Open app Feedback tab. ${e.message ?: ""}")
-        }
+        // Do not launch Flutter feedback screen. Web CRM will auto-open feedback form.
+        setLastMessage("Call ended. Feedback pending on Web CRM.")
     }
 
-
-    private fun enqueuePendingRecordingUpload(requestId: Int, leadId: Int, filePath: String, duration: String, error: String) {
-        try {
-            val queue = JSONArray(prefs.getString("pendingRecordingUploads", "[]") ?: "[]")
-            val item = JSONObject().apply {
-                put("request_id", requestId)
-                put("lead_id", leadId)
-                put("file_path", filePath)
-                put("duration", duration)
-                put("attempts", 0)
-                put("last_error", error)
-                put("created_at", System.currentTimeMillis())
-            }
-            queue.put(item)
-            prefs.edit()
-                .putString("pendingRecordingUploads", queue.toString())
-                .putInt("pendingRecordingUploadCount", queue.length())
-                .apply()
-        } catch (_: Exception) {}
-    }
-
-    private fun retryPendingRecordingUploads() {
-        if (!uploadRetrying.compareAndSet(false, true)) return
-        executor.execute {
-            try {
-                val raw = prefs.getString("pendingRecordingUploads", "[]") ?: "[]"
-                val queue = JSONArray(raw)
-                if (queue.length() == 0) return@execute
-                val crmUrl = prefs.getString("crmUrl", "") ?: ""
-                val userId = prefs.getInt("userId", 0)
-                val token = prefs.getString("token", "") ?: ""
-                if (crmUrl.isBlank() || userId <= 0 || token.isBlank()) return@execute
-
-                val remaining = JSONArray()
-                for (i in 0 until queue.length()) {
-                    val item = queue.optJSONObject(i) ?: continue
-                    val requestId = item.optInt("request_id", 0)
-                    val leadId = item.optInt("lead_id", 0)
-                    val filePath = item.optString("file_path", "")
-                    val duration = item.optString("duration", "")
-                    val file = File(filePath)
-                    if (requestId <= 0 || leadId <= 0 || !file.exists() || file.length() <= 64) continue
-                    try {
-                        val uploadedUrl = recorder?.uploadRecording(crmUrl, userId, token, requestId, leadId, file, duration) ?: ""
-                        prefs.edit().putString("lastRecordingUrl", uploadedUrl.ifBlank { "Uploaded on retry" }).apply()
-                        setLastMessage("Pending recording uploaded for request #$requestId")
-                    } catch (e: Exception) {
-                        item.put("attempts", item.optInt("attempts", 0) + 1)
-                        item.put("last_error", e.message ?: e.toString())
-                        item.put("last_attempt_at", System.currentTimeMillis())
-                        remaining.put(item)
-                    }
-                }
-                prefs.edit()
-                    .putString("pendingRecordingUploads", remaining.toString())
-                    .putInt("pendingRecordingUploadCount", remaining.length())
-                    .apply()
-            } catch (e: Exception) {
-                setLastMessage("Recording retry failed: ${e.message}")
-            } finally {
-                uploadRetrying.set(false)
-            }
-        }
+    private fun clearPendingFeedbackPrefs() {
+        prefs.edit()
+            .remove("pendingFeedback")
+            .remove("pendingFeedbackEventId")
+            .remove("pendingFeedbackRequestId")
+            .remove("pendingFeedbackLeadId")
+            .remove("pendingFeedbackLeadName")
+            .remove("pendingFeedbackPhone")
+            .remove("pendingFeedbackDuration")
+            .remove("pendingFeedbackCallStatus")
+            .remove("pendingFeedbackRecordingUrl")
+            .remove("pendingFeedbackNotes")
+            .remove("pendingFeedbackCreatedAt")
+            .apply()
     }
 
     private fun updateRequest(requestId: Int, status: String, message: String, duration: String, callStatus: String) {

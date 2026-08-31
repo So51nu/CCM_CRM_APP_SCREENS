@@ -35,7 +35,7 @@ class RecordingSaveScreen extends StatelessWidget {
                         children: [
                           Text(app.autoRecordingEnabled ? 'Auto Recording ON' : 'Auto Recording OFF', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
                           const SizedBox(height: 4),
-                          const Text('Call end hone ke baad recording CRM me upload hogi.', style: TextStyle(color: CcColors.textSoft)),
+                          const Text('', style: TextStyle(color: CcColors.textSoft)),
                         ],
                       ),
                     ),
@@ -45,13 +45,12 @@ class RecordingSaveScreen extends StatelessWidget {
                     value: app.autoRecordingEnabled,
                     onChanged: app.setAutoRecording,
                     title: const Text('Auto Recording Upload', style: TextStyle(fontWeight: FontWeight.w800)),
-                    subtitle: const Text('Recording file /api/upload-call-recording.php par save hogi', style: TextStyle(color: CcColors.textMuted)),
+                    subtitle: const Text('', style: TextStyle(color: CcColors.textMuted)),
                     contentPadding: EdgeInsets.zero,
                   ),
                   const Divider(color: CcColors.line),
                   KeyValueRow('Service', app.serviceRunning ? 'Running' : 'Stopped', icon: Icons.cloud_sync_rounded, valueColor: app.serviceRunning ? CcColors.green : CcColors.amber),
                   KeyValueRow('Last Native Message', app.lastNativeMessage, icon: Icons.message_outlined),
-                  KeyValueRow('Phone Folder', app.recordingFolderPath, icon: Icons.folder_special_outlined, valueColor: CcColors.blue300),
                 ],
               ),
             ),
@@ -62,7 +61,7 @@ class RecordingSaveScreen extends StatelessWidget {
                 children: [
                   const Text('Last Recording Result', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
                   const SizedBox(height: 12),
-                  KeyValueRow('Recording Folder', app.recordingFolderPath, icon: Icons.folder_special_outlined, valueColor: CcColors.blue300),
+                  KeyValueRow('Visible Storage Folder', app.lastRecordingFolder, icon: Icons.folder_special_rounded, valueColor: CcColors.blue300),
                   KeyValueRow('Local File Path', app.lastRecordingPath, icon: Icons.folder_outlined),
                   KeyValueRow('CRM Recording URL', app.lastRecordingUrl, icon: Icons.link_rounded, valueColor: app.lastRecordingUrl == '-' || app.lastRecordingUrl.isEmpty ? CcColors.amber : CcColors.green),
                   const SizedBox(height: 12),
@@ -92,7 +91,7 @@ class RecordingSaveScreen extends StatelessWidget {
             GlassCard(
               gradient: LinearGradient(colors: [CcColors.amber.withValues(alpha: .14), CcColors.card]),
               child: const Text(
-                'Important: Login ke baad app real phone storage ke app-specific Music/call_recordings folder ko ready karta hai. Har connected call ki .m4a file yahin local save hogi, call cut hote hi CRM upload hoga. Upload fail hua to file local rahegi aur service auto-retry karegi. Android me call recording device policy par depend karta hai; is app me microphone recording fallback hai. Phone, Microphone, Phone State permission allow rakho aur battery restriction Unrestricted rakho.',
+                'Calling CRM',
                 style: TextStyle(color: CcColors.textSoft, height: 1.45),
               ),
             ),

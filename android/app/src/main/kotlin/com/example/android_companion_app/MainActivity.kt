@@ -54,10 +54,9 @@ class MainActivity : FlutterActivity() {
                 "lastMessage" -> result.success(prefs.getString("lastMessage", "-") ?: "-")
                 "lastRecordingPath" -> result.success(prefs.getString("lastRecordingPath", "-") ?: "-")
                 "lastRecordingUrl" -> result.success(prefs.getString("lastRecordingUrl", "-") ?: "-")
-                "recordingFolderPath" -> result.success(prefs.getString("recordingFolderPath", "-") ?: "-")
+                "lastRecordingFolder" -> result.success(prefs.getString("recordingFolderPath", "Music/ClickConnectCRM/CallRecordings") ?: "Music/ClickConnectCRM/CallRecordings")
                 "ensureRecordingFolder" -> {
-                    val folder = CallRecorder(this).ensureRecordingFolder()
-                    result.success(folder.absolutePath)
+                    result.success(CallRecorder(this).ensureVisibleRecordingFolder())
                 }
                 "setAutoCallEnabled" -> {
                     val enabled = call.argument<Boolean>("enabled") ?: true
@@ -68,6 +67,11 @@ class MainActivity : FlutterActivity() {
                 "setAutoRecordingEnabled" -> {
                     val enabled = call.argument<Boolean>("enabled") ?: true
                     prefs.edit().putBoolean("autoRecordingEnabled", enabled).putBoolean("auto_recording_enabled", enabled).apply()
+                    result.success(true)
+                }
+                "setSpeakerCaptureMode" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: true
+                    prefs.edit().putBoolean("speakerCaptureMode", enabled).apply()
                     result.success(true)
                 }
                 "clearSession" -> {
@@ -111,41 +115,9 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
-
-
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 501) {
-            if (hasCorePermissions()) {
-                try { CallRecorder(this).ensureRecordingFolder() } catch (_: Exception) {}
-                val token = prefs.getString("token", "") ?: ""
-                if (token.isNotBlank()) CallPollingService.start(this, checkNow = true)
-                prefs.edit().putString("lastMessage", "Permissions allowed. Calling and recording service ready.").apply()
-            } else {
-                prefs.edit().putString("lastMessage", "Phone, Microphone and Phone State permissions are required for calling and recording.").apply()
-            }
-        }
-    }
-
     private fun readPendingFeedback(): Map<String, Any>? {
-        if (!prefs.getBoolean("pendingFeedback", false)) return null
-        val requestId = prefs.getInt("pendingFeedbackRequestId", 0)
-        if (requestId <= 0) return null
-        return mapOf(
-            "event_id" to (prefs.getString("pendingFeedbackEventId", "") ?: ""),
-            "request_id" to requestId,
-            "lead_id" to prefs.getInt("pendingFeedbackLeadId", 0),
-            "lead_name" to (prefs.getString("pendingFeedbackLeadName", "") ?: ""),
-            "phone" to (prefs.getString("pendingFeedbackPhone", "") ?: ""),
-            "duration" to (prefs.getString("pendingFeedbackDuration", "00:00:00") ?: "00:00:00"),
-            "call_status" to (prefs.getString("pendingFeedbackCallStatus", "Connected") ?: "Connected"),
-            "recording_url" to (prefs.getString("pendingFeedbackRecordingUrl", "") ?: ""),
-            "recording_path" to (prefs.getString("lastRecordingPath", "") ?: ""),
-            "recording_folder_path" to (prefs.getString("recordingFolderPath", "") ?: ""),
-            "notes" to (prefs.getString("pendingFeedbackNotes", "") ?: ""),
-            "created_at" to prefs.getLong("pendingFeedbackCreatedAt", 0L)
-        )
+        // Mobile feedback removed. Web CRM owns post-call feedback.
+        return null
     }
 
     private fun clearPendingFeedback() {
@@ -177,11 +149,12 @@ class MainActivity : FlutterActivity() {
         editor.putBoolean("auto_call_enabled", autoCall)
         editor.putBoolean("autoRecordingEnabled", autoRecording)
         editor.putBoolean("auto_recording_enabled", autoRecording)
+        editor.putBoolean("speakerCaptureMode", args["speakerCaptureMode"] as? Boolean ?: prefs.getBoolean("speakerCaptureMode", true))
         val pollingSeconds = ((args["pollingSeconds"] as? Number)?.toInt() ?: 1).coerceIn(1, 10)
         editor.putInt("pollingSeconds", pollingSeconds)
         editor.putInt("maxRecordingMinutes", ((args["maxRecordingMinutes"] as? Number)?.toInt() ?: 30).coerceIn(1, 120))
         editor.apply()
-        try { CallRecorder(this).ensureRecordingFolder() } catch (_: Exception) {}
+        CallRecorder(this).ensureVisibleRecordingFolder()
     }
 
     private fun normalizeBaseUrl(url: String): String {
@@ -203,6 +176,10 @@ class MainActivity : FlutterActivity() {
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.RECORD_AUDIO
         )
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }

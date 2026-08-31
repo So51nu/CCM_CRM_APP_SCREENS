@@ -22,6 +22,7 @@ class NativeCallBridge {
       'autoRecordingEnabled': autoRecordingEnabled,
       'pollingSeconds': 1,
       'maxRecordingMinutes': 30,
+      'speakerCaptureMode': true,
       'startService': startService,
     });
   }
@@ -72,20 +73,20 @@ class NativeCallBridge {
     }
   }
 
-  Future<String> recordingFolderPath() async {
+  Future<String> lastRecordingFolder() async {
     try {
-      return await _channel.invokeMethod<String>('recordingFolderPath') ?? '-';
+      return await _channel.invokeMethod<String>('lastRecordingFolder') ?? 'Music/ClickConnectCRM/CallRecordings';
     } catch (_) {
-      return '-';
+      return 'Music/ClickConnectCRM/CallRecordings';
     }
   }
 
-  Future<String> ensureRecordingFolder() async {
+  Future<Map<String, dynamic>> ensureRecordingFolder() async {
     try {
-      return await _channel.invokeMethod<String>('ensureRecordingFolder') ?? '-';
-    } catch (_) {
-      return '-';
-    }
+      final result = await _channel.invokeMethod<dynamic>('ensureRecordingFolder');
+      if (result is Map) return Map<String, dynamic>.from(result);
+    } catch (_) {}
+    return <String, dynamic>{'ready': false, 'path': 'Music/ClickConnectCRM/CallRecordings'};
   }
 
   Future<void> setAutoCallEnabled(bool enabled) async {
@@ -97,6 +98,12 @@ class NativeCallBridge {
   Future<void> setAutoRecordingEnabled(bool enabled) async {
     try {
       await _channel.invokeMethod('setAutoRecordingEnabled', {'enabled': enabled});
+    } catch (_) {}
+  }
+
+  Future<void> setSpeakerCaptureMode(bool enabled) async {
+    try {
+      await _channel.invokeMethod('setSpeakerCaptureMode', {'enabled': enabled});
     } catch (_) {}
   }
 
@@ -116,15 +123,9 @@ class NativeCallBridge {
       await _channel.invokeMethod('checkNow');
     } catch (_) {}
   }
-
   Future<Map<String, dynamic>?> pendingFeedback() async {
-    try {
-      final result = await _channel.invokeMethod<dynamic>('pendingFeedback');
-      if (result is Map) return Map<String, dynamic>.from(result);
-      return null;
-    } catch (_) {
-      return null;
-    }
+    // Mobile feedback removed: Web CRM handles all post-call feedback.
+    return null;
   }
 
   Future<void> clearPendingFeedback() async {

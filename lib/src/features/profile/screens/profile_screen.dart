@@ -94,7 +94,7 @@ class ProfileScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text('Logout karne ke baad app direct login page par redirect ho jayega.', style: TextStyle(color: CcColors.textMuted, height: 1.4)),
+                  const Text('', style: TextStyle(color: CcColors.textMuted, height: 1.4)),
                 ],
               ),
             ),
@@ -110,7 +110,7 @@ class ProfileScreen extends StatelessWidget {
       builder: (dialogContext) => AlertDialog(
         backgroundColor: CcColors.card,
         title: const Text('Logout?'),
-        content: const Text('Aap CRM mobile app se logout karna chahte ho?'),
+        content: const Text('Are You Sure to want to logout?'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
           FilledButton.icon(onPressed: () => Navigator.pop(dialogContext, true), icon: const Icon(Icons.logout_rounded), label: const Text('Logout')),
